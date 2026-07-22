@@ -14,6 +14,11 @@ STOPWORDS_SENTSTART = {
     "After", "Before", "Since", "While", "When", "Also",
 }
 
+# Generic acronyms/terms that are too common as standalone "entities" and
+# almost always false positives when captured alone (e.g. "AI" inside
+# "AI research organization" or "AI safety").
+GENERIC_TERMS = {"AI", "ML", "API", "US", "UK", "CEO", "CTO", "IT", "NLP", "IPO"}
+
 ORG_SUFFIXES = ("Inc", "Corp", "Corporation", "Labs", "Systems", "Technologies",
                 "Technology", "Ventures", "Group", "LLC", "Company", "Co")
 
@@ -42,6 +47,8 @@ def extract_candidate_entities(text):
         if first_word in STOPWORDS_SENTSTART and len(name.split()) == 1:
             continue
         if len(name) < 2:
+            continue
+        if len(name.split()) == 1 and name.upper() in GENERIC_TERMS:
             continue
         candidates[name] = candidates.get(name, 0) + 1
     names = sorted(candidates.keys(), key=len, reverse=True)
@@ -86,67 +93,151 @@ def guess_entity_type(name, text):
     return "Product"
 
 
-def build_patterns():
-    PN = r"([A-Z][a-zA-Z0-9]*(?:\s+[A-Z][a-zA-Z0-9]*){0,3})"
-    DET = r"(?:the\s+|a\s+|an\s+)?"
-    patterns = [
-        (rf"{PN}\s+(?:was|is)\s+(?:co-founded|founded|created|started|built)\s+by\s+{PN}", "REV_CREATE"),
-        (rf"{PN}\s+(?:co-founded|founded|created|started|built)\s+{DET}{PN}", "FWD_CREATE"),
-        (rf"{PN}\s+(?:was|is)\s+developed\s+by\s+{PN}", "REV_DEVELOP"),
-        (rf"{PN}\s+developed\s+{DET}{PN}", "FWD_DEVELOP"),
-        (rf"{PN}\s+integrates?\s+with\s+{DET}{PN}", "FWD_INTEGRATE"),
-        (rf"{PN}\s+(?:was|is)\s+integrated\s+into\s+{DET}{PN}", "FWD_INTEGRATE_INTO"),
-        (rf"{PN}\s+hired\s+{DET}{PN}", "FWD_HIRE"),
-        (rf"{PN}\s+(?:was|is)\s+authored\s+by\s+{PN}", "REV_AUTHOR"),
-        (rf"{PN}\s+authored\s+{DET}{PN}", "FWD_AUTHOR"),
-        (rf"{PN}\s+wrote\s+{DET}{PN}", "FWD_AUTHOR"),
-    ]
-    return [(re.compile(p), tag) for p, tag in patterns]
+# Trigger verbs -> canonical relation label (literal, matches the spec's
+# example which uses "CREATED" verbatim rather than remapping it).
+VERB_RELATION = {
+    "co-founded": "FOUNDED",
+    "cofounded": "FOUNDED",
+    "founded": "FOUNDED",
+    "co-founder of": "FOUNDED",
+    "founder of": "FOUNDED",
+    "created": "CREATED",
+    "creator of": "CREATED",
+    "started": "FOUNDED",
+    "built": "DEVELOPED",
+    "developed": "DEVELOPED",
+    "developer of": "DEVELOPED",
+    "integrates": "INTEGRATED_INTO",
+    "integrate": "INTEGRATED_INTO",
+    "integrated": "INTEGRATED_INTO",
+    "hired": "HIRED",
+    "authored": "AUTHORED",
+    "author of": "AUTHORED",
+    "wrote": "AUTHORED",
+}
+
+# Ordered longest-first so multi-word triggers ("co-founder of") are tried
+# before shorter overlapping ones.
+VERB_TRIGGERS = sorted(VERB_RELATION.keys(), key=len, reverse=True)
+
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+CONJ_SPLIT_RE = re.compile(r",\s*(?:and\s+)?|\s+and\s+")
 
 
-REL_PATTERNS = build_patterns()
+def find_entity_mentions(sentence, entity_names):
+    """Return list of (name, start, end) for every entity mention in the
+    sentence, longest names matched first so overlaps favor specificity."""
+    mentions = []
+    lower_sentence = sentence.lower()
+    ordered = sorted(entity_names, key=len, reverse=True)
+    taken = [False] * len(sentence)
+    for name in ordered:
+        name_lower = name.lower()
+        start = 0
+        while True:
+            idx = lower_sentence.find(name_lower, start)
+            if idx == -1:
+                break
+            end = idx + len(name_lower)
+            if not any(taken[idx:end]):
+                mentions.append((name, idx, end))
+                for i in range(idx, end):
+                    taken[i] = True
+            start = idx + 1
+    mentions.sort(key=lambda m: m[1])
+    return mentions
+
+
+def split_conjunction(sentence_slice, entity_names_set):
+    """Split a phrase like 'Elon Musk and Sam Altman' into individual entity
+    names, only keeping pieces that are known entities."""
+    parts = [p.strip() for p in CONJ_SPLIT_RE.split(sentence_slice) if p.strip()]
+    return [p for p in parts if p in entity_names_set]
 
 
 def extract_relationships(text, entities_by_name):
+    entity_names = list(entities_by_name.keys())
+    entity_names_set = set(entity_names)
     rels = []
     seen = set()
-    for regex, tag in REL_PATTERNS:
-        for m in regex.finditer(text):
-            a = clean_name(m.group(1))
-            b = clean_name(m.group(2))
-            if a == b:
-                continue
 
-            if tag == "REV_CREATE":
-                target, source = a, b
-                rel_type = "DEVELOPED" if entities_by_name.get(target) in ("Framework", "Product") else "FOUNDED"
-                src, tgt = source, target
-            elif tag == "FWD_CREATE":
-                source, target = a, b
-                rel_type = "DEVELOPED" if entities_by_name.get(target) in ("Framework", "Product") else "FOUNDED"
-                src, tgt = source, target
-            elif tag == "REV_DEVELOP":
-                src, tgt, rel_type = b, a, "DEVELOPED"
-            elif tag == "FWD_DEVELOP":
-                src, tgt, rel_type = a, b, "DEVELOPED"
-            elif tag == "FWD_INTEGRATE":
-                src, tgt, rel_type = a, b, "INTEGRATED_INTO"
-            elif tag == "FWD_INTEGRATE_INTO":
-                src, tgt, rel_type = a, b, "INTEGRATED_INTO"
-            elif tag == "FWD_HIRE":
-                src, tgt, rel_type = a, b, "HIRED"
-            elif tag == "REV_AUTHOR":
-                src, tgt, rel_type = b, a, "AUTHORED"
-            elif tag == "FWD_AUTHOR":
-                src, tgt, rel_type = a, b, "AUTHORED"
-            else:
-                continue
+    sentences = SENTENCE_SPLIT_RE.split(text)
+    for sentence in sentences:
+        mentions = find_entity_mentions(sentence, entity_names)
+        if len(mentions) < 2:
+            continue
 
-            key = (src, tgt, rel_type)
-            if key in seen:
-                continue
-            seen.add(key)
-            rels.append({"source": src, "target": tgt, "relation": rel_type})
+        lower_sentence = sentence.lower()
+        # Find the first (leftmost) relation-trigger verb in this sentence.
+        best_trigger = None
+        best_pos = None
+        for trigger in VERB_TRIGGERS:
+            pos = lower_sentence.find(trigger)
+            if pos != -1 and (best_pos is None or pos < best_pos):
+                best_pos = pos
+                best_trigger = trigger
+        if best_trigger is None:
+            continue
+
+        rel_type = VERB_RELATION[best_trigger]
+        verb_start = best_pos
+        verb_end = best_pos + len(best_trigger)
+
+        before_mentions = [m for m in mentions if m[2] <= verb_start]
+        after_mentions = [m for m in mentions if m[1] >= verb_end]
+
+        if not before_mentions or not after_mentions:
+            continue
+
+        # Detect passive voice: "<object> was/is <verb> by <subject>"
+        pre_verb_text = lower_sentence[:verb_start]
+        is_passive = bool(re.search(r"\b(was|is|were|are)\s+$", pre_verb_text.rstrip() + " ")) or \
+            bool(re.search(r"\b(was|is|were|are)\s+\w*\s*$", pre_verb_text))
+        post_verb_text = lower_sentence[verb_end:verb_end + 10]
+        has_by = post_verb_text.strip().startswith("by")
+
+        # Expand the nearest mention group on each side to catch conjunctions
+        # like "Elon Musk and Sam Altman" that were split into separate
+        # mentions but sit right next to each other before the verb.
+        left_names = [m[0] for m in before_mentions]
+        right_names = [m[0] for m in after_mentions]
+
+        if is_passive and has_by:
+            # object(s) before verb, subject(s) after "by"
+            objects = left_names
+            subjects = right_names
+        else:
+            subjects = left_names
+            objects = right_names
+
+        # Special-case three-argument integration phrasing like
+        # "Microsoft integrated GPT-4 into Copilot" — the actor (Microsoft)
+        # doing the integrating is not itself part of the INTEGRATED_INTO
+        # relation; the real relation is GPT-4 -> Copilot.
+        if rel_type == "INTEGRATED_INTO":
+            prep_match = re.search(r"\b(into|with)\b", lower_sentence[verb_end:verb_end + 40])
+            if prep_match:
+                prep_pos = verb_end + prep_match.start()
+                prep_end = verb_end + prep_match.end()
+                middle_names = [m[0] for m in mentions if m[1] >= verb_end and m[2] <= prep_pos]
+                after_prep_names = [m[0] for m in mentions if m[1] >= prep_end]
+                if middle_names and after_prep_names:
+                    subjects = middle_names
+                    objects = after_prep_names
+                elif after_prep_names:
+                    subjects = left_names
+                    objects = after_prep_names
+
+        for subj in subjects:
+            for obj in objects:
+                if subj == obj:
+                    continue
+                key = (subj, obj, rel_type)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rels.append({"source": subj, "target": obj, "relation": rel_type})
+
     return rels
 
 
